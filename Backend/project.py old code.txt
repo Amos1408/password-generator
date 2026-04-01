@@ -1,0 +1,264 @@
+from dotenv import load_dotenv
+load_dotenv()
+
+
+import secrets
+import string
+import bcrypt
+from getpass import getpass
+import re
+import time
+from flask import Flask, request, jsonify, g
+from flask_cors import CORS
+import sqlite3
+import jwt
+import os
+from datetime import datetime, timedelta
+import logging
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
+
+# Initialize logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Load environment variables
+MAX_LOGIN_ATTEMPTS = int(os.getenv('MAX_LOGIN_ATTEMPTS', 3))
+LOCKOUT_DURATION = int(os.getenv('LOCKOUT_DURATION', 300))  # in seconds
+JWT_SECRET = os.getenv('JWT_SECRET')
+if not JWT_SECRET:
+    raise ValueError("JWT_SECRET must be set in the environment")
+JWT_EXPIRATION = int(os.getenv('JWT_EXPIRATION', 3600))  # in seconds
+
+app = Flask(__name__)
+CORS(app)
+
+# Initialize rate limiter
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["5 per minute"]
+)
+
+# Database connection management
+def get_db():
+    if 'db' not in g:
+        g.db = sqlite3.connect('user.db')
+    return g.db
+
+@app.teardown_appcontext
+def close_db(exception):
+    db = g.pop('db', None)
+    if db is not None:
+        db.close()
+
+# Create table if not exists
+def init_db():
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+            username TEXT PRIMARY KEY,
+            password BLOB,
+            failed_attempts INTEGER DEFAULT 0,
+            lock_until TEXT DEFAULT NULL
+        )
+    """)
+    db.commit()
+
+# Wrap the init_db() call in an application context
+with app.app_context():
+    init_db()
+
+# Generate JWT token
+def generate_jwt(username):
+    expiration = datetime.utcnow() + timedelta(seconds=JWT_EXPIRATION)
+    payload = {
+        'username': username,
+        'exp': expiration
+    }
+    token = jwt.encode(payload, JWT_SECRET, algorithm='HS256')
+    if isinstance(token, bytes):
+        token = token.decode('utf-8')
+    return token
+
+# Generating password
+def generate_password(length=8):
+    if length < 8 or length > 64:
+        raise ValueError("Password length must be between 8 and 64 characters.")
+    characterSet = string.ascii_letters + string.digits + string.punctuation
+    password = "".join(secrets.choice(characterSet) for _ in range(length))
+    return password
+
+@app.route("/generate-password", methods=["GET"])
+def api_generate():
+    length = request.args.get('length', default=8, type=int)
+    try:
+        password = generate_password(length)
+        return jsonify({"password": password}), 200
+    except ValueError as e:
+        return jsonify({"message": str(e)}), 400
+
+# Hashing the password
+def hash_pass(password):
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
+    return hashed
+
+    #Registering the credentials in database
+def register(username, hashed_password):
+    try:
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute(
+            "INSERT INTO users (username, password, failed_attempts) VALUES (?, ?, ?)",
+            (username, hashed_password, 0)
+        )
+        db.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+@app.route("/register", methods=["POST"])
+def api_register():
+    data = request.json
+    username = data.get("username")
+    password = data.get("password")
+
+    if not username_validation(username):
+        return jsonify({"message": "Invalid username format"}), 400
+
+    if not password:
+        return jsonify({"message": "Password is required"}), 400
+
+    if len(password) < 8 or len(password) > 64:
+        return jsonify({"message": "Password must be between 8 and 64 characters"}), 400
+
+    if not password_validation(password):
+        return jsonify({"message": "Password must be at least 8 characters long, include a letter, a number, and a special character."}), 400
+
+    hashed = hash_pass(password)
+    success = register(username, hashed)
+
+    if not success:
+        return jsonify({"message": "Username already exists"}), 409
+
+    return jsonify({"message": "User registered successfully"}), 201
+
+# Login user with JWT
+def login_user(username, user_password):
+    if not username_validation(username):
+        return {"status": "error", "message": "Invalid username"}
+
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute(
+        "SELECT password, failed_attempts, lock_until FROM users WHERE username=?",
+        (username,)
+    )
+    result = cursor.fetchone()
+
+    if result is None:
+        logging.warning("Authentication failed")
+        return {"status": "error", "message": "Account does not exist"}
+
+    stored_hash, attempts, lock_until = result
+    current_time = int(time.time())
+
+    if current_time < lock_until:
+        remaining_time = lock_until - current_time
+        return {
+            "status": "locked",
+            "message": "Account is locked",
+            "remainingTime": remaining_time
+        }
+
+    if lock_until != 0 and current_time >= lock_until:
+        cursor.execute(
+            "UPDATE users SET failed_attempts=0, lock_until=0 WHERE username=?",
+            (username,)
+        )
+        db.commit()
+        attempts = 0
+        lock_until = 0
+
+    if bcrypt.checkpw(user_password.encode('utf-8'), stored_hash):
+        cursor.execute(
+            "UPDATE users SET failed_attempts=0 WHERE username=?",
+            (username,)
+        )
+        db.commit()
+        token = generate_jwt(username)
+        return {"status": "success", "message": "Login successful", "token": token}
+
+    else:
+        attempts += 1
+        if attempts >= MAX_LOGIN_ATTEMPTS:
+            lock_until = current_time + LOCKOUT_DURATION
+            cursor.execute(
+                "UPDATE users SET failed_attempts=?, lock_until=? WHERE username=?",
+                (attempts, lock_until, username)
+            )
+            db.commit()
+            logging.warning("Account locked for 5 minutes")
+            return {
+                "status": "locked",
+                "message": "Account locked",
+                "remainingTime": LOCKOUT_DURATION
+            }
+        else:
+            cursor.execute(
+                "UPDATE users SET failed_attempts=? WHERE username=?",
+                (attempts, username,)
+            )
+            db.commit()
+            logging.warning("Authentication failed")
+            return {"status": "error", "message": "Incorrect password"}
+
+@app.route("/login", methods=["POST"])
+@limiter.limit("3 per minute")
+def api_login():
+    data = request.json
+    username = data.get("username")
+    password = data.get("password")
+
+    result = login_user(username, password)
+
+    if result["status"] == "locked":
+        return jsonify({
+            "message": result["message"],
+            "remainingTime": result["remainingTime"]
+        }), 403
+
+    elif result["status"] == "success":
+        return jsonify({
+            "message": result["message"],
+            "token": result["token"]
+        }), 200
+
+    else:
+        return jsonify({
+            "message": result["message"]
+        }), 400
+
+
+def username_validation(username):
+    return bool(re.match(r"^[a-zA-Z0-9_]{3,20}$", username))
+
+def password_validation(password):
+    return bool(re.match(r"^(?=.*[A-Za-z])(?=.*\d)(?=.*[@$!%*?&]).{8,}$", password))
+
+      
+
+if __name__ == "__main__":
+    app.run(debug=True)
+
+
+
+
+#Auto redirect to login if token invalid
+
+#👤 Show username from JWT in Dashboard
+
+#⏳ Handle token expiration gracefully     We’ll lock Dashboard (only accessible with JWT)    Protect Dashboard (redirect if no token)
+#👉 Decode JWT and show username
