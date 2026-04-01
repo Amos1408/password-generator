@@ -106,6 +106,7 @@ LOCKOUT_DURATION=300
 ### Frontend (`frontend/.env`)
 
 ```
+For local development:
 VITE_APP_API_URL=http://localhost:5000
 ```
 
@@ -123,20 +124,9 @@ VITE_APP_API_URL=http://localhost:5000
 
 ---
 
-## 📌 Notes
-
-* Do NOT share `.env` files publicly
-* Make sure backend is running before frontend
-* Restart frontend after changing `.env`
-
----
 
 ## 👨‍💻 Author
 
 Developed by Amosh Kumar
 
 ---
-
-## 📜 License
-
-This project is for learning and educational purposes.
